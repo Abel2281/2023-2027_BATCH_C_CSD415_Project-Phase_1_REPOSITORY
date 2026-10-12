@@ -31,6 +31,10 @@ Does NOT touch budget_tracker.py directly -- that's already gated inside
 api_router.route() (called by validator.validate_with_retry, called by each
 agent). Orchestrator's own jobs: cache check, code-context building, agent
 sequencing, failure/degraded-mode aggregation, cache write.
+
+Each agent call is wrapped in terminal_ui.AgentStatus for a live spinner +
+elapsed-time display -- this is purely a presentation concern layered on
+top of the existing sequencing/error-handling, not a change to it.
 """
 
 from smart_audit.cache import hash_cache
@@ -46,6 +50,7 @@ from smart_audit.agents.schemas import (
     Verdict,
 )
 from smart_audit.router.validator import ValidationFailedError
+from smart_audit.utils.terminal_ui import AgentStatus
 
 # re-exported so cli.py only needs to import orchestrator, not api_router too
 from smart_audit.router.api_router import AllProvidersExhaustedError  # noqa: F401
@@ -68,6 +73,24 @@ def _build_code_context(finding: dict) -> str:
         for sl in fn.get("slices", []):
             parts.append(f"Lines {sl['start_line']}-{sl['end_line']}:\n{sl['code']}")
     return "\n\n".join(parts) if parts else "(no code context available)"
+
+
+def _run_with_status(role: str, detail: str, fn, *args):
+    """
+    Wraps one agent call with a live AgentStatus spinner. Re-raises any
+    exception after recording it on the status line, so the existing
+    except ValidationFailedError / propagate-AllProvidersExhaustedError
+    behavior in audit_finding() below is completely unchanged -- this only
+    adds display, not control flow.
+    """
+    with AgentStatus(role, detail) as status:
+        try:
+            result, meta = fn(*args)
+        except Exception as e:
+            status.fail(str(e))
+            raise
+        status.finish(meta.get("provider"), meta.get("model"), meta.get("degraded", False))
+        return result, meta
 
 
 def audit_finding(contract_source: str, finding: dict) -> DebateRecord:
@@ -103,15 +126,16 @@ def audit_finding(contract_source: str, finding: dict) -> DebateRecord:
 
     code_context = _build_code_context(finding)
     degraded = False
+    detail = finding.get("check", finding_id)
 
     try:
-        charge, meta1 = prosecute(finding, code_context)
+        charge, meta1 = _run_with_status("prosecutor", detail, prosecute, finding, code_context)
         degraded = degraded or meta1["degraded"]
 
-        rebuttal, meta2 = defend(finding, code_context, charge)
+        rebuttal, meta2 = _run_with_status("defender", detail, defend, finding, code_context, charge)
         degraded = degraded or meta2["degraded"]
 
-        verdict, meta3 = judge(finding, code_context, charge, rebuttal)
+        verdict, meta3 = _run_with_status("judge", detail, judge, finding, code_context, charge, rebuttal)
         degraded = degraded or meta3["degraded"]
 
     except ValidationFailedError as e:

@@ -16,6 +16,11 @@ Flow (Phase 1 in-memory, one disk write; Phase 3 courtroom, one more disk write)
 The debate-records write is a stand-in for Phase 4's real report_generator.py
 (a Markdown report) -- raw JSON for now so results are actually inspectable
 before that module exists.
+
+Phase 1 output is intentionally condensed to three lines (banner, target
+path, findings-ready count) for a demo audience -- see terminal_ui.py.
+Raw per-step diagnostics still exist internally but aren't printed by
+default; set CHAINGUARD_VERBOSE=1 to see api_router.py's dispatch log.
 """
 
 import json
@@ -30,14 +35,17 @@ from smart_audit.preprocessor.json_filter import filter_findings
 from smart_audit.preprocessor.code_slicer import slice_all
 from smart_audit import orchestrator
 from smart_audit.router.api_router import AllProvidersExhaustedError
-from smart_audit.agents.schemas import Verdict
 
 from smart_audit.utils.terminal_ui import (
     print_banner,
+    print_analyzing,
+    print_findings_ready,
+    print_courtroom_header,
     print_info,
-    print_success,
     print_warning,
     print_error,
+    print_verdict_card,
+    print_summary_table,
 )
 
 app = typer.Typer(
@@ -74,23 +82,6 @@ def _write_debate_records(records: list, contract_path: Path) -> Path:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return out_path
-
-
-def _print_courtroom_summary(records: list) -> None:
-    confirmed = sum(1 for r in records if r.judge.verdict == Verdict.CONFIRMED)
-    false_positive = sum(1 for r in records if r.judge.verdict == Verdict.FALSE_POSITIVE)
-    inconclusive = sum(1 for r in records if r.judge.verdict == Verdict.INCONCLUSIVE)
-    degraded_count = sum(1 for r in records if r.degraded_mode)
-
-    print_success(
-        f"Courtroom complete: {confirmed} confirmed, "
-        f"{false_positive} false positive, {inconclusive} inconclusive"
-    )
-    if degraded_count:
-        print_warning(
-            f"{degraded_count}/{len(records)} finding(s) ran in degraded mode "
-            f"(fallback provider/model, or a synthesized fallback verdict)."
-        )
 
 
 @app.command(name="run")
@@ -132,47 +123,39 @@ def run_cmd(
         print_error(f"Invalid file extension '{contract_path.suffix}'. Target must be a '.sol' file.")
         raise typer.Exit(code=1)
 
-    print_success(f"Validated target path: {contract_path.name}")
+    print_analyzing(contract_path)
 
     if fast:
         print_warning("Fast mode flag set (no-op until delay buffers exist).")
 
     # 2. Slither analysis (in-memory dict, scratch json deleted internally)
-    print_info("[1/3] Running Slither analysis...")
     raw_data = run_slither(contract_path)
 
     if not raw_data:
         print_error("Slither analysis failed or generated no output. Check if Slither and solc are installed.")
         raise typer.Exit(code=1)
 
-    detector_count = len(raw_data.get("results", {}).get("detectors", []))
-    print_success(f"{detector_count} findings detected")
-
     # 3. Filtering (in-memory, no disk I/O)
-    print_info("[2/3] Filtering High/Medium findings...")
     filtered_findings = filter_findings(raw_data, max_findings=max_findings)
-    print_success(f"{len(filtered_findings)} findings retained")
 
     # 4. AST code slicing (in-memory, no disk I/O)
-    print_info("[3/3] Extracting AST function code slices...")
     sliced_findings = slice_all(filtered_findings, contract_path)
 
-    # 5. Single end-of-phase-1 write
-    phase1_path = _write_phase1_output(sliced_findings, contract_path)
-    print_success(f"Phase 1 pre-processing complete -> {phase1_path.name}.")
+    # 5. Single end-of-phase-1 write (silent -- still written for inspection,
+    # just not announced with its own line per the condensed intro)
+    _write_phase1_output(sliced_findings, contract_path)
 
     if not sliced_findings:
         print_info("No findings survived filtering -- nothing for the courtroom to review.")
         return
 
+    print_findings_ready(len(sliced_findings))
+
     # 6. Courtroom pipeline: Prosecutor -> Defender -> Judge, per finding, cache-gated.
     # contract_source is read fresh here (not reassembled from code_slicer's
     # line-numbered slices) so hash_cache keys off the exact same bytes
     # slither/code_slicer already ran against.
-    print_info(
-        f"Running courtroom pipeline on {len(sliced_findings)} finding(s) "
-        f"(Prosecutor -> Defender -> Judge)..."
-    )
+    print_courtroom_header()
     contract_source = contract_path.read_text(encoding="utf-8", errors="replace")
 
     try:
@@ -183,11 +166,17 @@ def run_cmd(
         )
         raise typer.Exit(code=1)
 
-    _print_courtroom_summary(records)
+    # 7. Per-finding verdict cards + run summary (zip is safe here because
+    # orchestrator.audit_contract loops sliced_findings in order and appends
+    # exactly one record per finding, no reordering or dropping).
+    console_blank = "\n"
+    print(console_blank, end="")  # visual breathing room after the last spinner line
+    for record, finding in zip(records, sliced_findings):
+        print_verdict_card(record, finding)
+    print_summary_table(records)
 
-    # 7. Single end-of-phase-3 write (stand-in for Phase 4's report_generator.py)
-    debate_path = _write_debate_records(records, contract_path)
-    print_success(f"Debate records written -> {debate_path.name}.")
+    # 8. Single end-of-phase-3 write (stand-in for Phase 4's report_generator.py)
+    _write_debate_records(records, contract_path)
 
 
 if __name__ == "__main__":

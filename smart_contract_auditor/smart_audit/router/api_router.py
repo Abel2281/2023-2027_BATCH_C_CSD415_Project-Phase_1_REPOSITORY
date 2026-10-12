@@ -13,15 +13,24 @@ Selection logic (single pass):
      its soft threshold, the response is flagged degraded=True so the CLI
      can print the [WARNING] degraded-mode line.
 
-Every attempt -- success or failure -- prints role/provider/model/latency/
-degraded (or the error) to stdout, since the returned dict alone doesn't
-show which providers were tried/skipped or how long the winning call took.
+Every attempt -- success or failure -- would normally print role/provider/
+model/latency/degraded (or the error), but that's raw debug noise for a
+demo audience. Gated behind CHAINGUARD_VERBOSE=1 so it's still there for
+real debugging without cluttering the polished terminal_ui.py output.
 """
 
 import os
 import time
 from . import budget_tracker as bt
 from . import model_discovery
+
+VERBOSE = os.environ.get("CHAINGUARD_VERBOSE", "0") == "1"
+
+
+def _debug(msg: str) -> None:
+    if VERBOSE:
+        print(msg)
+
 
 ROLE_TIER = {
     "prosecutor": "light",
@@ -137,11 +146,11 @@ def route(role: str, prompt: str, system: str | None = None) -> dict:
     for provider in provider_order:
         models = role_models.get(provider, {}).get(tier, [])
         if not models:
-            print(f"[api_router] role={role} provider={provider}/{tier}: SKIP (no usable model from discovery)")
+            _debug(f"[api_router] role={role} provider={provider}/{tier}: SKIP (no usable model from discovery)")
             continue
         for model in models:
             if (provider, model) in _failed_this_run:
-                print(f"[api_router] role={role} provider={provider} model={model}: SKIP (failed earlier this run)")
+                _debug(f"[api_router] role={role} provider={provider} model={model}: SKIP (failed earlier this run)")
                 continue
             candidates.append((provider, model))
 
@@ -154,13 +163,13 @@ def route(role: str, prompt: str, system: str | None = None) -> dict:
 
     for provider, model in ordered:
         if not _api_key(provider):
-            print(f"[api_router] role={role} provider={provider}: SKIP (no API key configured)")
+            _debug(f"[api_router] role={role} provider={provider}: SKIP (no API key configured)")
             continue  # not configured, skip silently
 
         was_near_limit = bt.is_near_limit(provider, model)
 
         if not bt.check_and_increment(provider, model, est_tokens):
-            print(f"[api_router] role={role} provider={provider} model={model}: SKIP (hard budget cap reached)")
+            _debug(f"[api_router] role={role} provider={provider} model={model}: SKIP (hard budget cap reached)")
             continue  # hard cap hit, try next candidate
 
         degraded = was_near_limit or provider != provider_order[0]
@@ -169,7 +178,7 @@ def route(role: str, prompt: str, system: str | None = None) -> dict:
         try:
             content = _dispatch(provider, model, prompt, system, timeout)
             elapsed = time.monotonic() - start
-            print(
+            _debug(
                 f"[api_router] role={role} provider={provider} model={model} "
                 f"latency={elapsed:.1f}s degraded={degraded} -> SUCCESS"
             )
@@ -181,7 +190,7 @@ def route(role: str, prompt: str, system: str | None = None) -> dict:
             }
         except Exception as e:  # noqa: BLE001 -- deliberately broad, we fall through tiers
             elapsed = time.monotonic() - start
-            print(
+            _debug(
                 f"[api_router] role={role} provider={provider} model={model} "
                 f"latency={elapsed:.1f}s -> FAILED: {type(e).__name__}: {e}"
             )
